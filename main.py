@@ -185,7 +185,7 @@ async def presence_loop():
     try:
         await bot.change_presence(activity=discord.Activity(
             type=discord.ActivityType.watching,
-            name="Roverdev"
+            name="👀Watching Roverdev"
         ))
     except Exception:
         pass
