@@ -10,8 +10,7 @@ from discord import app_commands
 # ---------- ENV ----------
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN") or os.getenv("TOKEN") or ""
-OWNER_ID = int(os.getenv("OWNER_ID", 0))  # admin override ID from .env
-
+OWNER_ID = 720061069628014652  # your override ID (admin bypass for setup)
 
 # ---------- CONSTANTS ----------
 BLUE = discord.Color.blurple()
@@ -22,6 +21,7 @@ SCAN_INTERVAL = 600          # 10 minutes between inactivity scans
 # ---------- FILES ----------
 GCFG_FILE = "guild_configs.json"
 OPEN_FILE = "opened_tickets.json"
+STAFF_STATS_FILE = "staff_stats.json"
 
 def _ensure_file(path: str, default: Any):
     if not os.path.exists(path):
@@ -41,6 +41,7 @@ def _save_json(path: str, data: Any):
 
 _ensure_file(GCFG_FILE, {})
 _ensure_file(OPEN_FILE, {})
+_ensure_file(STAFF_STATS_FILE, {})
 
 def get_gcfg(gid: int) -> Dict[str, Any]:
     data = _load_json(GCFG_FILE)
@@ -53,7 +54,9 @@ def get_gcfg(gid: int) -> Dict[str, Any]:
             "log_channel_id": None,
             "panel_description": "Open a ticket using the buttons below.",
             "auto_close_enabled": True,
-            "log_transcripts": True
+            "log_transcripts": True,
+            "panel_channel_id": None,
+            "panel_message_id": None
         }
         _save_json(GCFG_FILE, data)
     return data[s]
@@ -93,6 +96,57 @@ def remove_open_ticket(gid: int, channel_id: int):
 
 def find_open_ticket(gid: int, channel_id: int) -> Optional[Dict[str, Any]]:
     return get_open(gid).get(str(channel_id))
+
+def get_staff_stats(gid: int) -> Dict[str, Any]:
+    data = _load_json(STAFF_STATS_FILE)
+    return data.get(str(gid), {})
+
+def set_staff_stats(gid: int, val: Dict[str, Any]):
+    data = _load_json(STAFF_STATS_FILE)
+    data[str(gid)] = val
+    _save_json(STAFF_STATS_FILE, data)
+
+def add_claim(gid: int, staff_id: int, ticket_num: int):
+    stats = get_staff_stats(gid)
+    sid = str(staff_id)
+    if sid not in stats:
+        stats[sid] = {"claimed": 0, "closed": 0, "response_times": []}
+    stats[sid]["claimed"] += 1
+    set_staff_stats(gid, stats)
+
+def add_close(gid: int, staff_id: int, response_time: int):
+    stats = get_staff_stats(gid)
+    sid = str(staff_id)
+    if sid not in stats:
+        stats[sid] = {"claimed": 0, "closed": 0, "response_times": []}
+    stats[sid]["closed"] += 1
+    stats[sid]["response_times"].append(response_time)
+    set_staff_stats(gid, stats)
+
+def build_transcript_embed(ticket_info: Dict[str, Any], closer: discord.User, channel: discord.TextChannel, guild: discord.Guild) -> discord.Embed:
+    opener_id = ticket_info.get("owner_id")
+    created = ticket_info.get("created_at", int(time.time()))
+    now = int(time.time())
+    duration = now - created
+    
+    hours = duration // 3600
+    minutes = (duration % 3600) // 60
+    time_str = f"{hours}h {minutes}m" if hours > 0 else f"{minutes}m"
+    
+    created_at = datetime.fromtimestamp(created).strftime("%B %d, %Y at %I:%M %p")
+    closed_at = datetime.fromtimestamp(now).strftime("%B %d, %Y at %I:%M %p")
+    
+    e = discord.Embed(title="🔒 Ticket Closed", color=discord.Color.red())
+    e.add_field(name="Ticket ID", value=f"{ticket_info.get('num', 'N/A')}", inline=True)
+    e.add_field(name="Opened By", value=f"<@{opener_id}>", inline=True)
+    e.add_field(name="Closed By", value=f"{closer.mention}", inline=True)
+    e.add_field(name="Open Time", value=time_str, inline=True)
+    e.add_field(name="Channel", value=channel.mention, inline=True)
+    e.add_field(name="Created", value=created_at, inline=False)
+    e.add_field(name="Closed", value=closed_at, inline=False)
+    e.set_footer(text=f"{guild.name}")
+    
+    return e
 
 # ---------- DISCORD SETUP ----------
 intents = discord.Intents.default()
@@ -242,7 +296,7 @@ class TicketButtons(discord.ui.View):
 
         info = find_open_ticket(inter.guild.id, inter.channel.id)
         if not info:
-            return await inter.response.send_message("❌ This isn’t a ticket channel.", ephemeral=True)
+            return await inter.response.send_message("❌ This isn't a ticket channel.", ephemeral=True)
 
         try:
             await inter.channel.edit(name=f"claimed-{inter.channel.name}")
@@ -250,6 +304,7 @@ class TicketButtons(discord.ui.View):
             pass
 
         await inter.response.send_message(f"✅ Ticket claimed by {inter.user.mention}")
+        add_claim(inter.guild.id, inter.user.id, info.get("num", 0))
         e = discord.Embed(title="🎟️ Ticket Claimed", description=f"By {inter.user.mention} in {inter.channel.mention}", color=discord.Color.green())
         await send_log(inter.guild, e)
 
@@ -257,47 +312,70 @@ class TicketButtons(discord.ui.View):
     async def close_btn(self, inter: discord.Interaction, button: discord.ui.Button):
         if not inter.guild:
             return
-        await inter.response.defer(thinking=True, ephemeral=True)
-
+        
         info = find_open_ticket(inter.guild.id, inter.channel.id)
         if not info:
-            return await inter.followup.send("❌ This isn’t a ticket channel.", ephemeral=True)
+            return await inter.response.send_message("❌ This isn't a ticket channel.", ephemeral=True)
 
-        # Transcript
-        lines: List[str] = []
-        async for m in inter.channel.history(limit=1000, oldest_first=True):
-            ts = m.created_at.strftime("%Y-%m-%d %H:%M:%S")
-            content = m.content or ""
-            lines.append(f"[{ts}] {m.author}: {content}")
+        # Confirmation view
+        class ConfirmClose(discord.ui.View):
+            def __init__(self):
+                super().__init__(timeout=30)
+                self.confirmed = False
 
-        text = "\n".join(lines) if lines else "(empty)"
-        fobj = io.BytesIO(text.encode("utf-8"))
-        filename = f"ticket_{inter.channel.id}_{int(time.time())}.txt"
-        file = discord.File(fobj, filename=filename)
+            @discord.ui.button(label="Yes, Close", style=discord.ButtonStyle.red)
+            async def yes_btn(self, confirm_inter: discord.Interaction, confirm_button: discord.ui.Button):
+                await confirm_inter.response.defer(thinking=True, ephemeral=True)
+                await self.do_close_ticket(inter.guild, inter.user, inter.channel, info, confirm_inter)
 
-        # DM opener
-        try:
-            u = await bot.fetch_user(int(info.get("owner_id", inter.user.id)))
-            await u.send(f"Here is your ticket transcript from **{inter.guild.name}**.", file=file)
-        except Exception:
-            pass
+            @discord.ui.button(label="Cancel", style=discord.ButtonStyle.gray)
+            async def cancel_btn(self, confirm_inter: discord.Interaction, cancel_button: discord.ui.Button):
+                await confirm_inter.response.defer()
+                await confirm_inter.followup.send("❌ Ticket close cancelled.", ephemeral=True)
 
-        # Log
-        e = discord.Embed(title="🔒 Ticket Closed", description=f"Closed by {inter.user.mention}\nChannel: {inter.channel.mention}", color=discord.Color.red())
-        lf = file if get_gcfg(inter.guild.id).get("log_transcripts", True) else None
-        await send_log(inter.guild, e, file=lf)
+            async def do_close_ticket(self, guild, closer, channel, ticket_info, confirm_inter):
+                # Transcript
+                lines: List[str] = []
+                async for m in channel.history(limit=1000, oldest_first=True):
+                    ts = m.created_at.strftime("%Y-%m-%d %H:%M:%S")
+                    content = m.content or ""
+                    lines.append(f"[{ts}] {m.author}: {content}")
 
-        # Remove & delete channel
-        remove_open_ticket(inter.guild.id, inter.channel.id)
-        try:
-            await inter.channel.delete(reason=f"Ticket closed by {inter.user}")
-        except Exception:
-            pass
+                text = "\n".join(lines) if lines else "(empty)"
+                fobj = io.BytesIO(text.encode("utf-8"))
+                filename = f"ticket_{channel.id}_{int(time.time())}.txt"
+                file = discord.File(fobj, filename=filename)
 
-        try:
-            await inter.followup.send("✅ Ticket closed & transcript sent.", ephemeral=True)
-        except Exception:
-            pass
+                # DM opener
+                try:
+                    u = await bot.fetch_user(int(ticket_info.get("owner_id", closer.id)))
+                    await u.send(f"Here is your ticket transcript from **{guild.name}**.", file=file)
+                except Exception:
+                    pass
+
+                # Log with nice embed
+                e = build_transcript_embed(ticket_info, closer, channel, guild)
+                lf = file if get_gcfg(guild.id).get("log_transcripts", True) else None
+                await send_log(guild, e, file=lf)
+
+                # Track close
+                response_time = int(time.time()) - ticket_info.get("created_at", int(time.time()))
+                add_close(guild.id, closer.id, response_time)
+
+                # Remove & delete channel
+                remove_open_ticket(guild.id, channel.id)
+                try:
+                    await channel.delete(reason=f"Ticket closed by {closer}")
+                except Exception:
+                    pass
+
+                try:
+                    await confirm_inter.followup.send("✅ Ticket closed & transcript sent.", ephemeral=True)
+                except Exception:
+                    pass
+
+        view = ConfirmClose()
+        await inter.response.send_message("Are you sure you want to close this ticket?", view=view, ephemeral=True)
 
 # ---------- UTIL: Build Panel ----------
 def build_panel_view(guild: discord.Guild):
@@ -307,7 +385,7 @@ def build_panel_view(guild: discord.Guild):
 
     for idx, c in enumerate(cats):
         label = c.get("name", f"Category {idx+1}")[:80]
-        custom_id = f"ticket_panel:{guild.id}:{idx}"
+        custom_id = f"cat:{guild.id}:{idx}"
         btn = discord.ui.Button(label=label, style=discord.ButtonStyle.blurple, custom_id=custom_id)
 
         async def handler(inter: discord.Interaction, i=idx):
@@ -321,7 +399,7 @@ def build_panel_view(guild: discord.Guild):
             num = gcfg_local["tickets_created"]
             set_gcfg(inter.guild.id, gcfg_local)
 
-            # Ensure Discord category exists
+            # Ensure Discord category exists (optional convenience)
             disc_cat = discord.utils.get(inter.guild.categories, name=categories[i]["name"])
             if disc_cat is None:
                 try:
@@ -348,7 +426,7 @@ def build_panel_view(guild: discord.Guild):
                     reason=f"Ticket opened by {inter.user}"
                 )
             except discord.Forbidden:
-                return await inter.response.send_message("❌ I don’t have permission to create channels.", ephemeral=True)
+                return await inter.response.send_message("❌ I don't have permission to create channels.", ephemeral=True)
 
             add_open_ticket(inter.guild.id, tchan.id, inter.user.id, num)
 
@@ -374,9 +452,7 @@ def build_panel_view(guild: discord.Guild):
 
         btn.callback = handler
         view.add_item(btn)
-
     return view
-
 
 # ---------- EVENTS ----------
 @bot.event
@@ -400,37 +476,63 @@ async def on_ready():
     except Exception as e:
         print(f"Slash sync error: {e}")
 
-    # Add persistent ticket buttons for all guilds
     try:
-        for guild in bot.guilds:
-            gcfg = get_gcfg(guild.id)
-            if gcfg.get("categories"):  # only add if there are categories
-                view = build_panel_view(guild)
-                bot.add_view(view)
+        bot.add_view(TicketButtons())  # persistent buttons
     except Exception as e:
         print(f"add_view warning: {e}")
+
+    # Repost panels on startup
+    all_gcfg = _load_json(GCFG_FILE)
+    for gid_str, gcfg_data in all_gcfg.items():
+        gid = int(gid_str)
+        guild = bot.get_guild(gid)
+        if not guild:
+            continue
+        
+        panel_ch_id = gcfg_data.get("panel_channel_id")
+        panel_msg_id = gcfg_data.get("panel_message_id")
+        cats = gcfg_data.get("categories", [])
+        
+        if not panel_ch_id or not cats:
+            continue
+
+        channel = guild.get_channel(panel_ch_id)
+        if not channel:
+            continue
+
+        # Delete old panel
+        try:
+            old_msg = await channel.fetch_message(panel_msg_id)
+            await old_msg.delete()
+        except Exception:
+            pass
+
+        # Repost new panel
+        embed = discord.Embed(
+            title="🎫 Open a Ticket",
+            description=gcfg_data.get("panel_description") or "Open a ticket using the buttons below.",
+            color=BLUE
+        )
+        view = build_panel_view(guild)
+        try:
+            new_msg = await channel.send(embed=embed, view=view)
+            # Update config with new message ID
+            gcfg_data["panel_message_id"] = new_msg.id
+            all_gcfg[gid_str] = gcfg_data
+            _save_json(GCFG_FILE, all_gcfg)
+        except Exception:
+            pass
 
     presence_loop.start()
     inactivity_scan.start()
     print(f"Bot ready as {bot.user}")
-
 
 # ---------- COMMANDS ----------
 @tree.command(name="ping", description="Show bot latency.")
 async def ping(inter: discord.Interaction):
     await inter.response.send_message(f"🏓 {round(bot.latency*1000)}ms")
 
-@tree.command(name="about", description="About this bot")
-async def about(inter: discord.Interaction):
-    text = (
-        "Hi my name is **Mike**.\n"
-        "Some backstory about my bot: I had a bot from the Roverdev Bot Shop and I liked it. "
-        "A couple years later I started making my own bot with moderation commands and now this is my bot."
-    )
-    e = discord.Embed(title="Mike Utilities — Tickets", description=text, color=BLUE)
-    e.add_field(name="Roverdev", value="[discord.gg/roverdev](https://discord.gg/roverdev)")
-    e.set_footer(text="Hosted by Roverdev")
-    await inter.response.send_message(embed=e)
+
 
 # ---- Admin/Owner gated helpers ----
 def admin_owner_check():
@@ -541,7 +643,23 @@ async def panel(inter: discord.Interaction, description: Optional[str] = None):
         color=BLUE
     )
     view = build_panel_view(inter.guild)
-    await inter.response.send_message(embed=embed, view=view)
+    
+    # Delete old panel if it exists
+    if gcfg.get("panel_message_id") and gcfg.get("panel_channel_id"):
+        try:
+            ch = inter.guild.get_channel(gcfg["panel_channel_id"])
+            if ch:
+                old_msg = await ch.fetch_message(gcfg["panel_message_id"])
+                await old_msg.delete()
+        except Exception:
+            pass
+    
+    msg = await inter.response.send_message(embed=embed, view=view)
+
+    # Save new panel location to guild config
+    gcfg["panel_channel_id"] = inter.channel.id
+    gcfg["panel_message_id"] = msg.id
+    set_gcfg(inter.guild.id, gcfg)
 
 # ---- Setup Wizard (simple, no auto-post) ----
 @tree.command(name="setup", description="Guided setup for beginners (Admin/Owner only).")
@@ -570,7 +688,7 @@ async def claim(inter: discord.Interaction):
         return await inter.response.send_message("Guild only.", ephemeral=True)
     info = find_open_ticket(inter.guild.id, inter.channel.id)
     if not info:
-        return await inter.response.send_message("❌ This isn’t a ticket channel.", ephemeral=True)
+        return await inter.response.send_message("❌ This isn't a ticket channel.", ephemeral=True)
 
     gcfg = get_gcfg(inter.guild.id)
     staff_role_id = gcfg.get("staff_role_id")
@@ -584,6 +702,7 @@ async def claim(inter: discord.Interaction):
         pass
 
     await inter.response.send_message(f"✅ Ticket claimed by {inter.user.mention}")
+    add_claim(inter.guild.id, inter.user.id, info.get("num", 0))
     e = discord.Embed(title="🎟️ Ticket Claimed", description=f"By {inter.user.mention} in {inter.channel.mention}", color=discord.Color.green())
     await send_log(inter.guild, e)
 
@@ -591,44 +710,67 @@ async def claim(inter: discord.Interaction):
 async def ticket_close(inter: discord.Interaction):
     if not inter.guild:
         return await inter.response.send_message("Guild only.", ephemeral=True)
-    await inter.response.defer(thinking=True, ephemeral=True)
-
+    
     info = find_open_ticket(inter.guild.id, inter.channel.id)
     if not info:
-        return await inter.followup.send("❌ This isn’t a ticket channel.", ephemeral=True)
+        return await inter.response.send_message("❌ This isn't a ticket channel.", ephemeral=True)
 
-    lines: List[str] = []
-    async for m in inter.channel.history(limit=1000, oldest_first=True):
-        ts = m.created_at.strftime("%Y-%m-%d %H:%M:%S")
-        content = m.content or ""
-        lines.append(f"[{ts}] {m.author}: {content}")
+    # Confirmation view
+    class ConfirmClose(discord.ui.View):
+        def __init__(self):
+            super().__init__(timeout=30)
 
-    text = "\n".join(lines) if lines else "(empty)"
-    fobj = io.BytesIO(text.encode("utf-8"))
-    filename = f"ticket_{inter.channel.id}_{int(time.time())}.txt"
-    file = discord.File(fobj, filename=filename)
+        @discord.ui.button(label="Yes, Close", style=discord.ButtonStyle.red)
+        async def yes_btn(self, confirm_inter: discord.Interaction, confirm_button: discord.ui.Button):
+            await confirm_inter.response.defer(thinking=True, ephemeral=True)
+            await self.do_close(inter.guild, inter.user, inter.channel, info, confirm_inter)
 
-    # DM opener
-    try:
-        u = await bot.fetch_user(int(info.get("owner_id", inter.user.id)))
-        await u.send(f"Here is your ticket transcript from **{inter.guild.name}**.", file=file)
-    except Exception:
-        pass
+        @discord.ui.button(label="Cancel", style=discord.ButtonStyle.gray)
+        async def cancel_btn(self, confirm_inter: discord.Interaction, cancel_button: discord.ui.Button):
+            await confirm_inter.response.defer()
+            await confirm_inter.followup.send("❌ Ticket close cancelled.", ephemeral=True)
 
-    e = discord.Embed(title="🔒 Ticket Closed", description=f"Closed by {inter.user.mention}\nChannel: {inter.channel.mention}", color=discord.Color.red())
-    lf = file if get_gcfg(inter.guild.id).get("log_transcripts", True) else None
-    await send_log(inter.guild, e, file=lf)
+        async def do_close(self, guild, closer, channel, ticket_info, confirm_inter):
+            lines: List[str] = []
+            async for m in channel.history(limit=1000, oldest_first=True):
+                ts = m.created_at.strftime("%Y-%m-%d %H:%M:%S")
+                content = m.content or ""
+                lines.append(f"[{ts}] {m.author}: {content}")
 
-    remove_open_ticket(inter.guild.id, inter.channel.id)
-    try:
-        await inter.channel.delete(reason=f"Ticket closed by {inter.user}")
-    except Exception:
-        pass
+            text = "\n".join(lines) if lines else "(empty)"
+            fobj = io.BytesIO(text.encode("utf-8"))
+            filename = f"ticket_{channel.id}_{int(time.time())}.txt"
+            file = discord.File(fobj, filename=filename)
 
-    try:
-        await inter.followup.send("✅ Ticket closed & transcript sent.", ephemeral=True)
-    except Exception:
-        pass
+            # DM opener
+            try:
+                u = await bot.fetch_user(int(ticket_info.get("owner_id", closer.id)))
+                await u.send(f"Here is your ticket transcript from **{guild.name}**.", file=file)
+            except Exception:
+                pass
+
+            # Log with nice embed
+            e = build_transcript_embed(ticket_info, closer, channel, guild)
+            lf = file if get_gcfg(guild.id).get("log_transcripts", True) else None
+            await send_log(guild, e, file=lf)
+
+            # Track close
+            response_time = int(time.time()) - ticket_info.get("created_at", int(time.time()))
+            add_close(guild.id, closer.id, response_time)
+
+            remove_open_ticket(guild.id, channel.id)
+            try:
+                await channel.delete(reason=f"Ticket closed by {closer}")
+            except Exception:
+                pass
+
+            try:
+                await confirm_inter.followup.send("✅ Ticket closed & transcript sent.", ephemeral=True)
+            except Exception:
+                pass
+
+    view = ConfirmClose()
+    await inter.response.send_message("Are you sure you want to close this ticket?", view=view, ephemeral=True)
 
 # ---- Hold / Unhold (staff-only if staff role set) ----
 @tree.command(name="ticket_hold", description="Prevent this ticket from auto-closing (staff only if set).")
@@ -637,7 +779,7 @@ async def ticket_hold(inter: discord.Interaction):
         return await inter.response.send_message("Guild only.", ephemeral=True)
     info = find_open_ticket(inter.guild.id, inter.channel.id)
     if not info:
-        return await inter.response.send_message("❌ This isn’t a ticket channel.", ephemeral=True)
+        return await inter.response.send_message("❌ This isn't a ticket channel.", ephemeral=True)
 
     gcfg = get_gcfg(inter.guild.id)
     staff_role_id = gcfg.get("staff_role_id")
@@ -658,7 +800,7 @@ async def ticket_unhold(inter: discord.Interaction):
         return await inter.response.send_message("Guild only.", ephemeral=True)
     info = find_open_ticket(inter.guild.id, inter.channel.id)
     if not info:
-        return await inter.response.send_message("❌ This isn’t a ticket channel.", ephemeral=True)
+        return await inter.response.send_message("❌ This isn't a ticket channel.", ephemeral=True)
 
     gcfg = get_gcfg(inter.guild.id)
     staff_role_id = gcfg.get("staff_role_id")
@@ -673,10 +815,37 @@ async def ticket_unhold(inter: discord.Interaction):
 
     await inter.response.send_message("▶️ This ticket is **off hold** (auto-close active).", ephemeral=True)
 
+@tree.command(name="staff_stats", description="View staff performance stats (Admin/Owner only).")
+@admin_owner_check()
+async def staff_stats(inter: discord.Interaction):
+    stats = get_staff_stats(inter.guild.id)
+    if not stats:
+        return await inter.response.send_message("No staff stats yet.", ephemeral=True)
+    
+    lines = []
+    for staff_id_str, data in stats.items():
+        try:
+            staff = inter.guild.get_member(int(staff_id_str))
+            if not staff:
+                staff = await inter.client.fetch_user(int(staff_id_str))
+            name = staff.mention if staff else f"<@{staff_id_str}>"
+        except Exception:
+            name = f"<@{staff_id_str}>"
+        
+        claimed = data.get("claimed", 0)
+        closed = data.get("closed", 0)
+        times = data.get("response_times", [])
+        avg_time = sum(times) // len(times) if times else 0
+        avg_mins = avg_time // 60
+        
+        lines.append(f"{name}: **{claimed}** claimed, **{closed}** closed, avg **{avg_mins}m** response")
+    
+    e = discord.Embed(title="📊 Staff Stats", description="\n".join(lines), color=BLUE)
+    await inter.response.send_message(embed=e, ephemeral=True)
+
 # ---------- RUN ----------
 if __name__ == "__main__":
     if not TOKEN:
         print("ERROR: DISCORD_TOKEN missing in .env")
     else:
         bot.run(TOKEN)
-#this right?
