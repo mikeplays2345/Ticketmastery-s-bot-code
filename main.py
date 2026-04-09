@@ -849,3 +849,4 @@ if __name__ == "__main__":
         print("ERROR: DISCORD_TOKEN missing in .env")
     else:
         bot.run(TOKEN)
+#test
