@@ -180,12 +180,25 @@ async def send_log(guild: discord.Guild, embed: discord.Embed, file: discord.Fil
         pass
 
 # ---------- PRESENCE ----------
-@tasks.loop(minutes=3)
+@tasks.loop(minutes=5)
 async def presence_loop():
+    statuses = [
+        ("Watching", "tickets 🎫"),
+        ("Watching", "support requests 📋"),
+        ("Playing", "Managing tickets 🎫"),
+        ("Listening", "Tickets | /help"),
+        ("Watching", "supporting servers 💬"),
+    ]
+    
+    current_status = statuses[int(time.time() / 300) % len(statuses)]
+    activity_type = discord.ActivityType.watching if current_status[0] == "Watching" else \
+                    discord.ActivityType.playing if current_status[0] == "Playing" else \
+                    discord.ActivityType.listening
+    
     try:
         await bot.change_presence(activity=discord.Activity(
-            type=discord.ActivityType.watching,
-            name="👀Watching Roverdev"
+            type=activity_type,
+            name=current_status[1]
         ))
     except Exception:
         pass
@@ -381,29 +394,48 @@ class TicketButtons(discord.ui.View):
 def build_panel_view(guild: discord.Guild):
     view = discord.ui.View(timeout=None)
     gcfg = get_gcfg(guild.id)
-    cats = gcfg.get("categories", [])[:10]
+    cats = gcfg.get("categories", [])[:25]  # Dropdowns support up to 25 options
 
+    # Build dropdown options
+    options = []
     for idx, c in enumerate(cats):
-        label = c.get("name", f"Category {idx+1}")[:80]
-        custom_id = f"cat:{guild.id}:{idx}"
-        btn = discord.ui.Button(label=label, style=discord.ButtonStyle.blurple, custom_id=custom_id)
+        label = c.get("name", f"Category {idx+1}")[:100]
+        options.append(discord.SelectOption(label=label, value=str(idx)))
 
-        async def handler(inter: discord.Interaction, i=idx):
+    if not options:
+        return view  # No categories, return empty view
+
+    # Create dropdown select
+    class TicketSelect(discord.ui.Select):
+        def __init__(self):
+            super().__init__(
+                placeholder="📋 Select a ticket category...",
+                min_values=1,
+                max_values=1,
+                options=options,
+                custom_id=f"ticket_select:{guild.id}"
+            )
+
+        async def callback(self, inter: discord.Interaction):
+            idx = int(self.values[0])
             gcfg_local = get_gcfg(inter.guild.id)
             categories = gcfg_local.get("categories", [])
-            if i >= len(categories):
+            
+            if idx >= len(categories):
                 return await inter.response.send_message("⚠️ That category no longer exists.", ephemeral=True)
+
+            await inter.response.defer(thinking=True, ephemeral=True)  # Defer immediately
 
             # Ticket counter
             gcfg_local["tickets_created"] = int(gcfg_local.get("tickets_created", 0)) + 1
             num = gcfg_local["tickets_created"]
             set_gcfg(inter.guild.id, gcfg_local)
 
-            # Ensure Discord category exists (optional convenience)
-            disc_cat = discord.utils.get(inter.guild.categories, name=categories[i]["name"])
+            # Ensure Discord category exists
+            disc_cat = discord.utils.get(inter.guild.categories, name=categories[idx]["name"])
             if disc_cat is None:
                 try:
-                    disc_cat = await inter.guild.create_category(categories[i]["name"])
+                    disc_cat = await inter.guild.create_category(categories[idx]["name"])
                 except Exception:
                     disc_cat = None
 
@@ -426,12 +458,12 @@ def build_panel_view(guild: discord.Guild):
                     reason=f"Ticket opened by {inter.user}"
                 )
             except discord.Forbidden:
-                return await inter.response.send_message("❌ I don't have permission to create channels.", ephemeral=True)
+                return await inter.followup.send("❌ I don't have permission to create channels.", ephemeral=True)
 
             add_open_ticket(inter.guild.id, tchan.id, inter.user.id, num)
 
             role_ping = ""
-            ping_role_id = categories[i].get("role_id")
+            ping_role_id = categories[idx].get("role_id")
             if ping_role_id:
                 role = inter.guild.get_role(int(ping_role_id))
                 if role:
@@ -439,7 +471,7 @@ def build_panel_view(guild: discord.Guild):
 
             embed = discord.Embed(
                 title="🎫 Ticket Opened",
-                description=f"**Category:** {categories[i]['name']}\nUser: {inter.user.mention}",
+                description=f"**Category:** {categories[idx]['name']}\nUser: {inter.user.mention}",
                 color=BLUE
             )
             await tchan.send(
@@ -448,11 +480,41 @@ def build_panel_view(guild: discord.Guild):
                 view=TicketButtons()
             )
 
-            await inter.response.send_message(f"✅ Ticket created: {tchan.mention}", ephemeral=True)
+            await inter.followup.send(f"✅ Ticket created: {tchan.mention}", ephemeral=True)
 
-        btn.callback = handler
-        view.add_item(btn)
+    view.add_item(TicketSelect())
     return view
+
+# ---------- HELP COMMAND ----------
+@bot.tree.command(name="help", description="Get help and support info")
+async def help_command(inter: discord.Interaction):
+    embed = discord.Embed(
+        title="📘 TicketMastery Help",
+        color=BLUE
+    )
+    embed.add_field(
+        name="🎫 Tickets",
+        value="`/ticket_close` – Close your ticket\n`/claim` – Claim a ticket",
+        inline=False
+    )
+    embed.add_field(
+        name="⚙️ Setup",
+        value="`/set_staff` – Set staff role\n`/set_logs` – Set log channel\n`/categories_add` – Add category",
+        inline=False
+    )
+    embed.add_field(
+        name="🛠️ Admin",
+        value="`/panel` – Create ticket panel\n`/auto_close` – Toggle auto-close",
+        inline=False
+    )
+    embed.add_field(
+        name="🔗 Support",
+        value="[Join Support Server](https://discord.gg/TsbRPDXWJS) for help, updates, and feedback!",
+        inline=False
+    )
+    embed.set_footer(text="TicketMastery • Always here to help")
+    
+    await inter.response.send_message(embed=embed)
 
 # ---------- EVENTS ----------
 @bot.event
@@ -659,27 +721,7 @@ async def panel(inter: discord.Interaction, description: Optional[str] = None):
     # Save new panel location to guild config
     gcfg["panel_channel_id"] = inter.channel.id
     gcfg["panel_message_id"] = msg.id
-    set_gcfg(inter.guild.id, gcfg)
 
-# ---- Setup Wizard (simple, no auto-post) ----
-@tree.command(name="setup", description="Guided setup for beginners (Admin/Owner only).")
-@admin_owner_check()
-async def setup(inter: discord.Interaction):
-    gcfg = get_gcfg(inter.guild.id)
-    cats = gcfg.get("categories", [])
-    desc = gcfg.get("panel_description", "")
-    staff = gcfg.get("staff_role_id")
-    logs = gcfg.get("log_channel_id")
-    auto_on = gcfg.get("auto_close_enabled", True)
-
-    e = discord.Embed(title="🧩 Setup Checklist", color=BLUE)
-    e.add_field(name="1) Staff Role (optional)", value=f"Set with `/set_staff` — **{'set' if staff else 'not set'}**", inline=False)
-    e.add_field(name="2) Log Channel", value=f"Set with `/set_logs` — **{'set' if logs else 'not set'}**", inline=False)
-    e.add_field(name="3) Categories", value=f"Add with `/categories_add` — **{len(cats)} added** (up to 10).", inline=False)
-    e.add_field(name="4) Panel Description", value=f"Change with `/set_panel_desc`.\nCurrent: {desc[:200] + ('…' if len(desc)>200 else '')}", inline=False)
-    e.add_field(name="5) Auto-Close", value=f"Toggle with `/auto_close` — **{'ON' if auto_on else 'OFF'}**", inline=False)
-    e.set_footer(text="When ready, run /panel to post the buttons.")
-    await inter.response.send_message(embed=e, ephemeral=True)
 
 # ---- Ticket Actions ----
 @tree.command(name="claim", description="Claim the current ticket (staff only if staff role is set).")
@@ -849,4 +891,3 @@ if __name__ == "__main__":
         print("ERROR: DISCORD_TOKEN missing in .env")
     else:
         bot.run(TOKEN)
-#test
