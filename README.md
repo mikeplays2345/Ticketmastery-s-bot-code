@@ -5,8 +5,8 @@ A modern Discord ticket utility bot focused on simple, reliable support workflow
 ⸻
 
 Requirements
-	•	Python 3.12+
-	•	discord.py 2.x
+	•	Python 3.13+
+	•	discord.py 2.6
 	•	A Discord bot application with required intents enabled
 
 This project targets Python 3.12+. Older Python versions are not officially supported.
@@ -34,7 +34,7 @@ Automatic File Creation
 On first run, the bot will automatically generate the following files if they do not exist:
 	•	guild_configs.json – per-server configuration storage
 	•	opened_tickets.json – active ticket tracking
-
+	•	staff_status.json - tracks staff preformance
 No manual setup is required for these files.
 
 ⸻
