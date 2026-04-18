@@ -63,6 +63,8 @@ This bot is hosted using Roverdev
 
 Support Server: https://discord.gg/roverdev
 
+Mike is not using roverdev anymore because left
+
 ⸻
 
 License
