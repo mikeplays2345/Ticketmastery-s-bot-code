@@ -59,7 +59,7 @@ All ticket closures (manual or automatic) can be logged to a designated log chan
 
 Hosting
 
-This bot is hosted using Roverdev
+This bot was hosted using Roverdev
 
 Support Server: https://discord.gg/roverdev
 
