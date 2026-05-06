@@ -80,4 +80,4 @@ Contributions are welcome.
 	•	Create a feature branch
 	•	Submit a pull request with clear changes
 
-Please keep code style consistent and target Python 3.12+.
+Please keep code style consistent and target Python 3.13+,
