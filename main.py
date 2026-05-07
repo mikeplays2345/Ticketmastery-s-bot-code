@@ -19,10 +19,11 @@ REMINDER_BEFORE = 24 * 3600  # send reminder when <= 24h left
 SCAN_INTERVAL = 600          # 10 minutes between inactivity scans
 
 # ---------- FILES ----------
-GCFG_FILE = "guild_configs.json"
-OPEN_FILE = "opened_tickets.json"
-STAFF_STATS_FILE = "staff_stats.json"
-DB_FILE = "ticketbot.db"
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+GCFG_FILE = os.path.join(SCRIPT_DIR, "guild_configs.json")
+OPEN_FILE = os.path.join(SCRIPT_DIR, "opened_tickets.json")
+STAFF_STATS_FILE = os.path.join(SCRIPT_DIR, "staff_stats.json")
+DB_FILE = os.path.join(SCRIPT_DIR, "ticketbot.db")
 
 def _ensure_file(path: str, default: Any):
     if not os.path.exists(path):
