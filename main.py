@@ -20,34 +20,12 @@ SCAN_INTERVAL = 600          # 10 minutes between inactivity scans
 
 # ---------- FILES ----------
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-GCFG_FILE = os.path.join(SCRIPT_DIR, "guild_configs.json")
-OPEN_FILE = os.path.join(SCRIPT_DIR, "opened_tickets.json")
-STAFF_STATS_FILE = os.path.join(SCRIPT_DIR, "staff_stats.json")
-DB_FILE = os.path.join(SCRIPT_DIR, "ticketbot.db")
-
-def _ensure_file(path: str, default: Any):
-    if not os.path.exists(path):
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(default, f, indent=4)
-
-def _load_json(path: str) -> Any:
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-def _save_json(path: str, data: Any):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=4)
-
-_ensure_file(GCFG_FILE, {})
-_ensure_file(OPEN_FILE, {})
-_ensure_file(STAFF_STATS_FILE, {})
+DB_FILE = os.path.join(SCRIPT_DIR, "guild_config.db")
 
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
+
     c.execute('''CREATE TABLE IF NOT EXISTS guild_configs (
         guild_id INTEGER PRIMARY KEY,
         tickets_created INTEGER DEFAULT 0,
@@ -60,6 +38,27 @@ def init_db():
         panel_channel_id INTEGER,
         panel_message_id INTEGER
     )''')
+
+    c.execute('''CREATE TABLE IF NOT EXISTS open_tickets (
+        guild_id INTEGER,
+        channel_id INTEGER PRIMARY KEY,
+        owner_id INTEGER,
+        num INTEGER,
+        created_at INTEGER,
+        last_activity INTEGER,
+        reminded24 INTEGER DEFAULT 0,
+        hold INTEGER DEFAULT 0
+    )''')
+
+    c.execute('''CREATE TABLE IF NOT EXISTS staff_stats (
+        guild_id INTEGER,
+        staff_id INTEGER,
+        claimed INTEGER DEFAULT 0,
+        closed INTEGER DEFAULT 0,
+        response_times TEXT DEFAULT '[]',
+        PRIMARY KEY (guild_id, staff_id)
+    )''')
+
     conn.commit()
     conn.close()
 
@@ -83,30 +82,19 @@ def get_gcfg(gid: int) -> Dict[str, Any]:
             "panel_channel_id": row[8],
             "panel_message_id": row[9]
         }
-    else:
-        # Fallback to JSON backup
-        data = _load_json(GCFG_FILE)
-        s = str(gid)
-        if s in data:
-            # Migrate from JSON to DB
-            config = data[s]
-            set_gcfg(gid, config)
-            return config
-        else:
-            # Insert default
-            default = {
-                "tickets_created": 0,
-                "categories": [],
-                "staff_role_id": None,
-                "log_channel_id": None,
-                "panel_description": "Open a ticket using the buttons below.",
-                "auto_close_enabled": True,
-                "log_transcripts": True,
-                "panel_channel_id": None,
-                "panel_message_id": None
-            }
-            set_gcfg(gid, default)
-            return default
+    default = {
+        "tickets_created": 0,
+        "categories": [],
+        "staff_role_id": None,
+        "log_channel_id": None,
+        "panel_description": "Open a ticket using the buttons below.",
+        "auto_close_enabled": True,
+        "log_transcripts": True,
+        "panel_channel_id": None,
+        "panel_message_id": None
+    }
+    set_gcfg(gid, default)
+    return default
 
 def get_all_gcfg() -> Dict[str, Dict[str, Any]]:
     conn = sqlite3.connect(DB_FILE)
@@ -140,68 +128,185 @@ def set_gcfg(gid: int, val: Dict[str, Any]):
         (gid, val["tickets_created"], json.dumps(val["categories"]), val["staff_role_id"], val["log_channel_id"], val["panel_description"], int(val["auto_close_enabled"]), int(val["log_transcripts"]), val["panel_channel_id"], val["panel_message_id"]))
     conn.commit()
     conn.close()
-    
-    # Save to JSON as backup
-    data = _load_json(GCFG_FILE)
-    data[str(gid)] = val
-    _save_json(GCFG_FILE, data)
 
-def get_open(gid: int) -> Dict[str, Any]:
-    data = _load_json(OPEN_FILE)
-    return data.get(str(gid), {})
+def get_open_tickets(gid: int) -> Dict[str, Dict[str, Any]]:
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('SELECT * FROM open_tickets WHERE guild_id = ?', (gid,))
+    rows = c.fetchall()
+    conn.close()
+    result = {}
+    for row in rows:
+        result[str(row[1])] = {  # channel_id as key
+            "owner_id": row[2],
+            "num": row[3],
+            "created_at": row[4],
+            "last_activity": row[5],
+            "reminded24": bool(row[6]),
+            "hold": bool(row[7])
+        }
+    return result
 
-def set_open(gid: int, val: Dict[str, Any]):
-    data = _load_json(OPEN_FILE)
-    data[str(gid)] = val
-    _save_json(OPEN_FILE, data)
+def set_open_tickets(gid: int, tickets: Dict[str, Dict[str, Any]]):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    # Delete existing tickets for this guild
+    c.execute('DELETE FROM open_tickets WHERE guild_id = ?', (gid,))
+    # Insert new tickets
+    for channel_id, info in tickets.items():
+        c.execute('''INSERT INTO open_tickets 
+            (guild_id, channel_id, owner_id, num, created_at, last_activity, reminded24, hold)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+            (gid, int(channel_id), info["owner_id"], info["num"], info["created_at"], 
+             info["last_activity"], int(info["reminded24"]), int(info["hold"])))
+    conn.commit()
+    conn.close()
+
+def get_all_open_tickets() -> Dict[str, Dict[str, Dict[str, Any]]]:
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('SELECT * FROM open_tickets')
+    rows = c.fetchall()
+    conn.close()
+    result = {}
+    for row in rows:
+        gid = str(row[0])
+        ch_id = str(row[1])
+        if gid not in result:
+            result[gid] = {}
+        result[gid][ch_id] = {
+            "owner_id": row[2],
+            "num": row[3],
+            "created_at": row[4],
+            "last_activity": row[5],
+            "reminded24": bool(row[6]),
+            "hold": bool(row[7])
+        }
+    return result
 
 def add_open_ticket(gid: int, channel_id: int, owner_id: int, num: int):
-    cur = get_open(gid)
     now = int(time.time())
-    cur[str(channel_id)] = {
-        "owner_id": owner_id,
-        "num": num,
-        "created_at": now,
-        "last_activity": now,
-        "reminded24": False,
-        "hold": False
-    }
-    set_open(gid, cur)
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('''
+        INSERT OR REPLACE INTO open_tickets
+        (guild_id, channel_id, owner_id, num, created_at, last_activity)
+        VALUES (?, ?, ?, ?, ?, ?)
+    ''', (gid, channel_id, owner_id, num, now, now))
+    conn.commit()
+    conn.close()
 
 def remove_open_ticket(gid: int, channel_id: int):
-    cur = get_open(gid)
-    if str(channel_id) in cur:
-        del cur[str(channel_id)]
-        set_open(gid, cur)
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute(
+        "DELETE FROM open_tickets WHERE guild_id=? AND channel_id=?",
+        (gid, channel_id)
+    )
+    conn.commit()
+    conn.close()
 
-def find_open_ticket(gid: int, channel_id: int) -> Optional[Dict[str, Any]]:
-    return get_open(gid).get(str(channel_id))
+def get_open_ticket(gid: int, channel_id: int):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute(
+        "SELECT * FROM open_tickets WHERE guild_id=? AND channel_id=?",
+        (gid, channel_id)
+    )
+    row = c.fetchone()
+    conn.close()
 
-def get_staff_stats(gid: int) -> Dict[str, Any]:
-    data = _load_json(STAFF_STATS_FILE)
-    return data.get(str(gid), {})
+    if not row:
+        return None
 
-def set_staff_stats(gid: int, val: Dict[str, Any]):
-    data = _load_json(STAFF_STATS_FILE)
-    data[str(gid)] = val
-    _save_json(STAFF_STATS_FILE, data)
+    return {
+        "owner_id": row[2],
+        "num": row[3],
+        "created_at": row[4],
+        "last_activity": row[5],
+        "reminded24": bool(row[6]),
+        "hold": bool(row[7])
+    }
+
+def update_ticket_activity(gid: int, channel_id: int):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('''
+        UPDATE open_tickets
+        SET last_activity = ?
+        WHERE guild_id=? AND channel_id=?
+    ''', (int(time.time()), gid, channel_id))
+    conn.commit()
+    conn.close()
+
+def get_staff_stats(gid: int):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT staff_id, claimed, closed, response_times FROM staff_stats WHERE guild_id=?", (gid,))
+    rows = c.fetchall()
+    conn.close()
+
+    result = {}
+    for r in rows:
+        result[str(r[0])] = {
+            "claimed": r[1],
+            "closed": r[2],
+            "response_times": json.loads(r[3] or "[]")
+        }
+    return result
+
+def set_staff_stats(gid: int, stats: Dict[str, Dict[str, Any]]):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    # Delete existing stats for this guild
+    c.execute('DELETE FROM staff_stats WHERE guild_id = ?', (gid,))
+    # Insert new stats
+    for staff_id, data in stats.items():
+        c.execute('''INSERT INTO staff_stats 
+            (guild_id, staff_id, claimed, closed, response_times)
+            VALUES (?, ?, ?, ?, ?)''',
+            (gid, int(staff_id), data["claimed"], data["closed"], json.dumps(data["response_times"])))
+    conn.commit()
+    conn.close()
 
 def add_claim(gid: int, staff_id: int, ticket_num: int):
-    stats = get_staff_stats(gid)
-    sid = str(staff_id)
-    if sid not in stats:
-        stats[sid] = {"claimed": 0, "closed": 0, "response_times": []}
-    stats[sid]["claimed"] += 1
-    set_staff_stats(gid, stats)
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('''
+        INSERT INTO staff_stats (guild_id, staff_id, claimed, closed, response_times)
+        VALUES (?, ?, 1, 0, '[]')
+        ON CONFLICT(guild_id, staff_id)
+        DO UPDATE SET claimed = claimed + 1
+    ''', (gid, staff_id))
+    conn.commit()
+    conn.close()
 
 def add_close(gid: int, staff_id: int, response_time: int):
     stats = get_staff_stats(gid)
-    sid = str(staff_id)
-    if sid not in stats:
-        stats[sid] = {"claimed": 0, "closed": 0, "response_times": []}
-    stats[sid]["closed"] += 1
-    stats[sid]["response_times"].append(response_time)
-    set_staff_stats(gid, stats)
+
+    current = stats.get(str(staff_id), {"claimed": 0, "closed": 0, "response_times": []})
+    current["closed"] += 1
+    current["response_times"].append(response_time)
+
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('''
+        INSERT INTO staff_stats (guild_id, staff_id, claimed, closed, response_times)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(guild_id, staff_id)
+        DO UPDATE SET
+            closed = closed + 1,
+            response_times = ?
+    ''', (
+        gid,
+        staff_id,
+        current["claimed"],
+        current["closed"],
+        json.dumps(current["response_times"]),
+        json.dumps(current["response_times"])
+    ))
+    conn.commit()
+    conn.close()
 
 def build_transcript_embed(ticket_info: Dict[str, Any], closer: discord.User, channel: discord.TextChannel, guild: discord.Guild) -> discord.Embed:
     opener_id = ticket_info.get("owner_id")
@@ -289,7 +394,7 @@ async def inactivity_scan():
     if not bot.is_ready():
         return
     now = int(time.time())
-    open_all = _load_json(OPEN_FILE)
+    open_all = get_all_open_tickets()
 
     # Loop guilds & channels
     for g_key, channels in list(open_all.items()):
@@ -320,7 +425,7 @@ async def inactivity_scan():
                         info["reminded24"] = True
                         channels[ch_key] = info
                         open_all[g_key] = channels
-                        _save_json(OPEN_FILE, open_all)
+                        set_open_tickets(gid, channels)
                     except Exception:
                         pass
                 continue
@@ -370,7 +475,7 @@ async def inactivity_scan():
                 # Remove regardless of channel delete success
                 del channels[ch_key]
                 open_all[g_key] = channels
-                _save_json(OPEN_FILE, open_all)
+                set_open_tickets(gid, channels)
 
 # ---------- PERSISTENT BUTTONS ----------
 class TicketButtons(discord.ui.View):
@@ -387,7 +492,7 @@ class TicketButtons(discord.ui.View):
             if staff_role_id not in [r.id for r in inter.user.roles]:
                 return await inter.response.send_message("🚫 Only staff can claim this ticket.", ephemeral=True)
 
-        info = find_open_ticket(inter.guild.id, inter.channel.id)
+        info = get_open_ticket(inter.guild.id, inter.channel.id)
         if not info:
             return await inter.response.send_message("❌ This isn't a ticket channel.", ephemeral=True)
 
@@ -406,7 +511,7 @@ class TicketButtons(discord.ui.View):
         if not inter.guild:
             return
         
-        info = find_open_ticket(inter.guild.id, inter.channel.id)
+        info = get_open_ticket(inter.guild.id, inter.channel.id)
         if not info:
             return await inter.response.send_message("❌ This isn't a ticket channel.", ephemeral=True)
 
@@ -602,12 +707,9 @@ async def on_message(message: discord.Message):
     # Update inactivity only for non-bot messages inside open tickets
     if message.author.bot or not message.guild:
         return
-    info = find_open_ticket(message.guild.id, message.channel.id)
+    info = get_open_ticket(message.guild.id, message.channel.id)
     if info:
-        open_map = get_open(message.guild.id)
-        info["last_activity"] = int(time.time())
-        open_map[str(message.channel.id)] = info
-        set_open(message.guild.id, open_map)
+        update_ticket_activity(message.guild.id, message.channel.id)
     await bot.process_commands(message)
 
 @bot.event
@@ -807,7 +909,7 @@ async def panel(inter: discord.Interaction, description: Optional[str] = None):
 async def claim(inter: discord.Interaction):
     if not inter.guild:
         return await inter.response.send_message("Guild only.", ephemeral=True)
-    info = find_open_ticket(inter.guild.id, inter.channel.id)
+    info = get_open_ticket(inter.guild.id, inter.channel.id)
     if not info:
         return await inter.response.send_message("❌ This isn't a ticket channel.", ephemeral=True)
 
@@ -832,7 +934,7 @@ async def ticket_close(inter: discord.Interaction):
     if not inter.guild:
         return await inter.response.send_message("Guild only.", ephemeral=True)
     
-    info = find_open_ticket(inter.guild.id, inter.channel.id)
+    info = get_open_ticket(inter.guild.id, inter.channel.id)
     if not info:
         return await inter.response.send_message("❌ This isn't a ticket channel.", ephemeral=True)
 
@@ -898,7 +1000,7 @@ async def ticket_close(inter: discord.Interaction):
 async def ticket_hold(inter: discord.Interaction):
     if not inter.guild:
         return await inter.response.send_message("Guild only.", ephemeral=True)
-    info = find_open_ticket(inter.guild.id, inter.channel.id)
+    info = get_open_ticket(inter.guild.id, inter.channel.id)
     if not info:
         return await inter.response.send_message("❌ This isn't a ticket channel.", ephemeral=True)
 
@@ -909,9 +1011,9 @@ async def ticket_hold(inter: discord.Interaction):
             return await inter.response.send_message("🚫 Only staff can hold tickets.", ephemeral=True)
 
     info["hold"] = True
-    om = get_open(inter.guild.id)
+    om = get_open_tickets(inter.guild.id)
     om[str(inter.channel.id)] = info
-    set_open(inter.guild.id, om)
+    set_open_tickets(inter.guild.id, om)
 
     await inter.response.send_message("⛔ This ticket is now **on hold** (no auto-close).", ephemeral=True)
 
@@ -919,7 +1021,7 @@ async def ticket_hold(inter: discord.Interaction):
 async def ticket_unhold(inter: discord.Interaction):
     if not inter.guild:
         return await inter.response.send_message("Guild only.", ephemeral=True)
-    info = find_open_ticket(inter.guild.id, inter.channel.id)
+    info = get_open_ticket(inter.guild.id, inter.channel.id)
     if not info:
         return await inter.response.send_message("❌ This isn't a ticket channel.", ephemeral=True)
 
@@ -930,9 +1032,9 @@ async def ticket_unhold(inter: discord.Interaction):
             return await inter.response.send_message("🚫 Only staff can unhold tickets.", ephemeral=True)
 
     info["hold"] = False
-    om = get_open(inter.guild.id)
+    om = get_open_tickets(inter.guild.id)
     om[str(inter.channel.id)] = info
-    set_open(inter.guild.id, om)
+    set_open_tickets(inter.guild.id, om)
 
     await inter.response.send_message("▶️ This ticket is **off hold** (auto-close active).", ephemeral=True)
 
