@@ -1,4 +1,4 @@
-import os, json, io, asyncio, time
+import os, json, io, asyncio, time, sqlite3
 from typing import Dict, Any, Optional, List
 from datetime import datetime
 from dotenv import load_dotenv
@@ -22,6 +22,7 @@ SCAN_INTERVAL = 600          # 10 minutes between inactivity scans
 GCFG_FILE = "guild_configs.json"
 OPEN_FILE = "opened_tickets.json"
 STAFF_STATS_FILE = "staff_stats.json"
+DB_FILE = "ticketbot.db"
 
 def _ensure_file(path: str, default: Any):
     if not os.path.exists(path):
@@ -43,25 +44,103 @@ _ensure_file(GCFG_FILE, {})
 _ensure_file(OPEN_FILE, {})
 _ensure_file(STAFF_STATS_FILE, {})
 
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS guild_configs (
+        guild_id INTEGER PRIMARY KEY,
+        tickets_created INTEGER DEFAULT 0,
+        categories TEXT DEFAULT '[]',
+        staff_role_id INTEGER,
+        log_channel_id INTEGER,
+        panel_description TEXT DEFAULT 'Open a ticket using the buttons below.',
+        auto_close_enabled INTEGER DEFAULT 1,
+        log_transcripts INTEGER DEFAULT 1,
+        panel_channel_id INTEGER,
+        panel_message_id INTEGER
+    )''')
+    conn.commit()
+    conn.close()
+
+init_db()
+
 def get_gcfg(gid: int) -> Dict[str, Any]:
-    data = _load_json(GCFG_FILE)
-    s = str(gid)
-    if s not in data:
-        data[s] = {
-            "tickets_created": 0,
-            "categories": [],
-            "staff_role_id": None,
-            "log_channel_id": None,
-            "panel_description": "Open a ticket using the buttons below.",
-            "auto_close_enabled": True,
-            "log_transcripts": True,
-            "panel_channel_id": None,
-            "panel_message_id": None
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('SELECT * FROM guild_configs WHERE guild_id = ?', (gid,))
+    row = c.fetchone()
+    conn.close()
+    if row:
+        return {
+            "tickets_created": row[1],
+            "categories": json.loads(row[2]) if row[2] else [],
+            "staff_role_id": row[3],
+            "log_channel_id": row[4],
+            "panel_description": row[5],
+            "auto_close_enabled": bool(row[6]),
+            "log_transcripts": bool(row[7]),
+            "panel_channel_id": row[8],
+            "panel_message_id": row[9]
         }
-        _save_json(GCFG_FILE, data)
-    return data[s]
+    else:
+        # Fallback to JSON backup
+        data = _load_json(GCFG_FILE)
+        s = str(gid)
+        if s in data:
+            # Migrate from JSON to DB
+            config = data[s]
+            set_gcfg(gid, config)
+            return config
+        else:
+            # Insert default
+            default = {
+                "tickets_created": 0,
+                "categories": [],
+                "staff_role_id": None,
+                "log_channel_id": None,
+                "panel_description": "Open a ticket using the buttons below.",
+                "auto_close_enabled": True,
+                "log_transcripts": True,
+                "panel_channel_id": None,
+                "panel_message_id": None
+            }
+            set_gcfg(gid, default)
+            return default
+
+def get_all_gcfg() -> Dict[str, Dict[str, Any]]:
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('SELECT * FROM guild_configs')
+    rows = c.fetchall()
+    conn.close()
+    result = {}
+    for row in rows:
+        gid = str(row[0])
+        result[gid] = {
+            "tickets_created": row[1],
+            "categories": json.loads(row[2]) if row[2] else [],
+            "staff_role_id": row[3],
+            "log_channel_id": row[4],
+            "panel_description": row[5],
+            "auto_close_enabled": bool(row[6]),
+            "log_transcripts": bool(row[7]),
+            "panel_channel_id": row[8],
+            "panel_message_id": row[9]
+        }
+    return result
 
 def set_gcfg(gid: int, val: Dict[str, Any]):
+    # Save to DB
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('''INSERT OR REPLACE INTO guild_configs 
+        (guild_id, tickets_created, categories, staff_role_id, log_channel_id, panel_description, auto_close_enabled, log_transcripts, panel_channel_id, panel_message_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+        (gid, val["tickets_created"], json.dumps(val["categories"]), val["staff_role_id"], val["log_channel_id"], val["panel_description"], int(val["auto_close_enabled"]), int(val["log_transcripts"]), val["panel_channel_id"], val["panel_message_id"]))
+    conn.commit()
+    conn.close()
+    
+    # Save to JSON as backup
     data = _load_json(GCFG_FILE)
     data[str(gid)] = val
     _save_json(GCFG_FILE, data)
@@ -544,7 +623,7 @@ async def on_ready():
         print(f"add_view warning: {e}")
 
     # Repost panels on startup
-    all_gcfg = _load_json(GCFG_FILE)
+    all_gcfg = get_all_gcfg()
     for gid_str, gcfg_data in all_gcfg.items():
         gid = int(gid_str)
         guild = bot.get_guild(gid)
@@ -580,8 +659,7 @@ async def on_ready():
             new_msg = await channel.send(embed=embed, view=view)
             # Update config with new message ID
             gcfg_data["panel_message_id"] = new_msg.id
-            all_gcfg[gid_str] = gcfg_data
-            _save_json(GCFG_FILE, all_gcfg)
+            set_gcfg(gid, gcfg_data)
         except Exception:
             pass
 
