@@ -1,3 +1,8 @@
+#Note add edit categories to admin panel
+#Note add how long you want auto close to be in admin panel
+#Note add when bot restarts the panel keeps working and don't delete the old panel and keep it working
+#Note add Anti spam for claiming tickets
+#Add better transcripts to send to users
 import os, io, asyncio, time, sqlite3
 from typing import Dict, Any, Optional, List
 from datetime import datetime
@@ -1214,28 +1219,33 @@ async def help_command(inter: discord.Interaction):
         title="📘 TicketMastery Help",
         color=BLUE
     )
+
     embed.add_field(
         name="🎫 Tickets",
         value="`/ticket_close` – Close your ticket\n`/claim` – Claim a ticket",
         inline=False
     )
+
     embed.add_field(
         name="⚙️ Setup",
-        value="`/admin_panel` – Manage categories, auto-close, and ticket settings"
+        value="`/admin_panel` – Manage categories, auto-close, and ticket settings",
         inline=False
     )
+
     embed.add_field(
         name="🛠️ Admin",
         value="All admin functions are now in `/admin_panel`",
         inline=False
     )
+
     embed.add_field(
         name="🔗 Support",
         value="[Join Support Server](https://discord.gg/TsbRPDXWJS) for help, updates, and feedback!",
         inline=False
     )
+
     embed.set_footer(text="TicketMastery • Always here to help")
-    
+
     await inter.response.send_message(embed=embed)
 
 # ---------- EVENTS ----------
