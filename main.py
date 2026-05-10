@@ -1221,7 +1221,7 @@ async def help_command(inter: discord.Interaction):
     )
     embed.add_field(
         name="⚙️ Setup",
-        value="`/admin_panel` – Open admin dashboard\n`/categories_list` – View categories",
+        value="`/admin_panel` – Manage categories, auto-close, and ticket settings"
         inline=False
     )
     embed.add_field(
