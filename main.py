@@ -1,8 +1,3 @@
-#Note add edit categories to admin panel
-#Note add how long you want auto close to be in admin panel
-#Note add when bot restarts the panel keeps working and don't delete the old panel and keep it working
-#Note add Anti spam for claiming tickets
-#Add better transcripts to send to users
 import os, io, asyncio, time, sqlite3
 from typing import Dict, Any, Optional, List
 from datetime import datetime
@@ -354,6 +349,7 @@ def update_ticket_activity(gid: int, channel_id: int):
     conn.close()
 
 def get_staff_stats(gid: int) -> Dict[str, Dict[str, int]]:
+    # DEPRECATED: Staff stats not currently used
     conn = get_db_connection()
     c = conn.cursor()
     c.execute("SELECT staff_id, claimed, closed FROM staff_stats WHERE guild_id=?", (gid,))
@@ -369,6 +365,7 @@ def get_staff_stats(gid: int) -> Dict[str, Dict[str, int]]:
     return result
 
 def set_staff_stats(gid: int, stats: Dict[str, Dict[str, Any]]):
+    # DEPRECATED: Staff stats not currently used
     conn = get_db_connection()
     c = conn.cursor()
     c.execute('DELETE FROM staff_stats WHERE guild_id = ?', (gid,))
@@ -381,6 +378,7 @@ def set_staff_stats(gid: int, stats: Dict[str, Dict[str, Any]]):
     conn.close()
 
 def add_claim(gid: int, staff_id: int):
+    # DEPRECATED: Staff stats not currently used
     conn = get_db_connection()
     c = conn.cursor()
     c.execute('''
@@ -393,6 +391,7 @@ def add_claim(gid: int, staff_id: int):
     conn.close()
 
 def add_close(gid: int, staff_id: int, response_time: int):
+    # DEPRECATED: Staff stats not currently used
     conn = get_db_connection()
     c = conn.cursor()
     c.execute('''
@@ -409,6 +408,7 @@ def add_close(gid: int, staff_id: int, response_time: int):
     conn.close()
 
 def get_avg_response_time(gid: int, staff_id: int) -> int:
+    # DEPRECATED: Staff stats not currently used
     conn = get_db_connection()
     c = conn.cursor()
     c.execute('''
@@ -881,6 +881,7 @@ def build_panel_view(guild: discord.Guild):
 
             await inter.response.defer(thinking=True, ephemeral=True)
 
+            # TODO: Add anti-spam for ticket creation (one per user every 60 seconds)
             # Load config for ticket creation
             gcfg_local = get_gcfg(inter.guild.id)
             
@@ -974,6 +975,7 @@ def build_panel_embed(guild: discord.Guild) -> discord.Embed:
     return embed
 
 def build_stats_embed(guild: discord.Guild) -> discord.Embed:
+    # DEPRECATED: Staff stats not currently used in admin panel
     stats = get_staff_stats(guild.id)
     embed = discord.Embed(
         title="📊 Staff Statistics",
@@ -1112,13 +1114,6 @@ class AdminPanelView(discord.ui.View):
             ephemeral=True
         )
 
-    @discord.ui.button(label="📊 Stats", style=discord.ButtonStyle.secondary)
-    async def stats(self, inter: discord.Interaction, button: discord.ui.Button):
-        await inter.response.send_message(
-            embed=build_stats_embed(inter.guild),
-            ephemeral=True
-        )
-
 class SettingsView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=180)
@@ -1133,6 +1128,7 @@ class SettingsView(discord.ui.View):
 
     @discord.ui.button(label="🔁 Toggle Auto-Close", style=discord.ButtonStyle.gray)
     async def autoclose(self, inter: discord.Interaction, button: discord.ui.Button):
+        # TODO: Add setting for auto-close duration in admin panel (currently hardcoded to 48 hours)
         gcfg = get_gcfg(inter.guild.id)
         gcfg["auto_close_enabled"] = not gcfg["auto_close_enabled"]
         set_gcfg(inter.guild.id, gcfg)
@@ -1163,6 +1159,7 @@ class CategoryView(discord.ui.View):
     async def add(self, inter: discord.Interaction, button: discord.ui.Button):
         await inter.response.send_modal(AddCategoryModal())
 
+    # TODO: Add ability to edit existing categories from admin panel
     @discord.ui.button(label="🗑️ Clear Categories", style=discord.ButtonStyle.red)
     async def clear(self, inter: discord.Interaction, button: discord.ui.Button):
         clear_categories(inter.guild.id)
@@ -1182,6 +1179,7 @@ class PanelManagerView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=180)
 
+    # TODO: Ensure panel persists across bot restarts and old panels continue to work
     @discord.ui.button(label="📨 Send Panel Here", style=discord.ButtonStyle.green)
     async def send(self, inter: discord.Interaction, button: discord.ui.Button):
         await send_ticket_panel(inter)
@@ -1352,10 +1350,12 @@ async def claim(inter: discord.Interaction):
     if not info:
         return await inter.response.send_message("❌ This isn't a ticket channel.", ephemeral=True)
 
+    # TODO: Add anti-spam for claiming tickets (one per user every 60 seconds)
     gcfg = get_gcfg(inter.guild.id)
     staff_role_id = gcfg.get("staff_role_id")
     if staff_role_id and isinstance(inter.user, discord.Member):
         if staff_role_id not in [r.id for r in inter.user.roles]:
+            # TODO: Add warning message that staff role is unknown, tell staff who tried to claim it
             return await inter.response.send_message("🚫 Only staff can claim this ticket.", ephemeral=True)
 
     try:
@@ -1405,6 +1405,7 @@ async def ticket_close(inter: discord.Interaction):
             
             if success:
                 try:
+                    # TODO: Add better transcripts to send to users (improved formatting and details)
                     await confirm_inter.followup.send("✅ Ticket closed & transcript sent.", ephemeral=True)
                 except Exception:
                     pass
