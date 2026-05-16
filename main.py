@@ -20,6 +20,10 @@ SCAN_INTERVAL = 600          # 10 minutes between inactivity scans
 
 # Safety guard for preventing double-trigger interactions
 ACTIVE_INTERACTIONS = set()
+TICKET_CREATION_COOLDOWN_SECONDS = 60
+
+# Track ticket creation cooldowns per user (runtime only)
+ticket_creation_cooldowns: Dict[int, int] = {}
 
 # ---------- FILES ----------
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -238,6 +242,29 @@ def clear_categories(gid: int):
     conn.close()
 
 
+def update_category(gid: int, category_id: int, name: str, role_id: int | None):
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute("""
+        UPDATE ticket_categories
+        SET name = ?, role_id = ?
+        WHERE guild_id = ? AND id = ?
+    """, (name, role_id, gid, category_id))
+    conn.commit()
+    conn.close()
+
+
+def remove_category(gid: int, category_id: int):
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute(
+        "DELETE FROM ticket_categories WHERE guild_id = ? AND id = ?",
+        (gid, category_id)
+    )
+    conn.commit()
+    conn.close()
+
+
 def get_open_tickets(gid: int) -> Dict[str, Dict[str, Any]]:
     conn = get_db_connection()
     c = conn.cursor()
@@ -336,6 +363,31 @@ def get_open_ticket(gid: int, channel_id: int):
         "reminded24": bool(row[6]),
         "hold": bool(row[7])
     }
+
+
+def get_open_ticket_by_owner(gid: int, owner_id: int):
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute(
+        "SELECT * FROM open_tickets WHERE guild_id=? AND owner_id=?",
+        (gid, owner_id)
+    )
+    row = c.fetchone()
+    conn.close()
+
+    if not row:
+        return None
+
+    return {
+        "channel_id": row[1],
+        "owner_id": row[2],
+        "num": row[3],
+        "created_at": row[4],
+        "last_activity": row[5],
+        "reminded24": bool(row[6]),
+        "hold": bool(row[7])
+    }
+
 
 def update_ticket_activity(gid: int, channel_id: int):
     conn = get_db_connection()
@@ -873,19 +925,30 @@ def build_panel_view(guild: discord.Guild):
 
         async def callback(self, inter: discord.Interaction):
             category_id = int(self.values[0])
-            gcfg_local = get_gcfg(inter.guild.id)
             category = get_category(inter.guild.id, category_id)
-            
+
             if not category:
                 return await inter.response.send_message("⚠️ That category no longer exists.", ephemeral=True)
 
+            now = int(time.time())
+            if get_open_ticket_by_owner(inter.guild.id, inter.user.id):
+                return await inter.response.send_message(
+                    "❌ You already have an open ticket. Close it before opening a new one.",
+                    ephemeral=True
+                )
+
+            last_attempt = ticket_creation_cooldowns.get(inter.user.id, 0)
+            remaining = TICKET_CREATION_COOLDOWN_SECONDS - (now - last_attempt)
+            if remaining > 0:
+                return await inter.response.send_message(
+                    f"⏳ Please wait {remaining}s before creating another ticket.",
+                    ephemeral=True
+                )
+
             await inter.response.defer(thinking=True, ephemeral=True)
 
-            # TODO: Add anti-spam for ticket creation (one per user every 60 seconds)
-            # Load config for ticket creation
             gcfg_local = get_gcfg(inter.guild.id)
             
-            # Use TicketManager to create ticket safely
             tchan = await TicketManager.create_ticket(
                 inter,
                 inter.guild,
@@ -893,10 +956,11 @@ def build_panel_view(guild: discord.Guild):
                 category,
                 gcfg_local
             )
-            
+
             if not tchan:
                 return await inter.followup.send("❌ Failed to create ticket channel.", ephemeral=True)
 
+            ticket_creation_cooldowns[inter.user.id] = now
             role_ping = ""
             ping_role_id = category.get("role_id")
             if ping_role_id:
@@ -954,7 +1018,7 @@ def build_categories_embed(guild: discord.Guild) -> discord.Embed:
             nm = c.get("name", f"Category {i}")
             rid = c.get("role_id")
             rp = f"<@&{rid}>" if rid else "No ping"
-            lines.append(f"{i}. **{nm}** — {rp}")
+            lines.append(f"{i}. **{nm}** (ID: `{c['id']}`) — {rp}")
         embed.add_field(name=f"Categories ({len(cats)}/10)", value="\n".join(lines), inline=False)
     
     return embed
@@ -1070,6 +1134,55 @@ class AddCategoryModal(discord.ui.Modal, title="Add Ticket Category"):
             msg += f" (pings <@&{role_id}>)"
         await inter.response.send_message(msg, ephemeral=True)
 
+class EditCategoryModal(discord.ui.Modal, title="Edit Ticket Category"):
+    category_id = discord.ui.TextInput(label="Category ID", placeholder="Enter the category ID to edit")
+    name = discord.ui.TextInput(label="New Category Name", placeholder="Enter the updated category name")
+    role_id = discord.ui.TextInput(label="Ping Role ID (optional)", placeholder="Enter new role ID or leave blank", required=False)
+
+    async def on_submit(self, inter: discord.Interaction):
+        try:
+            category_id = int(self.category_id.value)
+        except ValueError:
+            return await inter.response.send_message("❌ Invalid category ID.", ephemeral=True)
+
+        category = get_category(inter.guild.id, category_id)
+        if not category:
+            return await inter.response.send_message("❌ Category not found.", ephemeral=True)
+
+        role_id = None
+        if self.role_id.value:
+            try:
+                role_id = int(self.role_id.value)
+                role = inter.guild.get_role(role_id)
+                if not role:
+                    return await inter.response.send_message("❌ Role not found in this server.", ephemeral=True)
+            except ValueError:
+                return await inter.response.send_message("❌ Invalid role ID. Please enter a number.", ephemeral=True)
+
+        update_category(inter.guild.id, category_id, self.name.value, role_id)
+        await audit(inter.guild, inter.user, f"edited category '{category['name']}' to '{self.name.value}'")
+        msg = f"✅ Updated category `{self.name.value}`"
+        if role_id:
+            msg += f" (pings <@&{role_id}>)"
+        await inter.response.send_message(msg, ephemeral=True)
+
+class DeleteCategoryModal(discord.ui.Modal, title="Delete Ticket Category"):
+    category_id = discord.ui.TextInput(label="Category ID", placeholder="Enter the category ID to delete")
+
+    async def on_submit(self, inter: discord.Interaction):
+        try:
+            category_id = int(self.category_id.value)
+        except ValueError:
+            return await inter.response.send_message("❌ Invalid category ID.", ephemeral=True)
+
+        category = get_category(inter.guild.id, category_id)
+        if not category:
+            return await inter.response.send_message("❌ Category not found.", ephemeral=True)
+
+        remove_category(inter.guild.id, category_id)
+        await audit(inter.guild, inter.user, f"deleted category '{category['name']}'")
+        await inter.response.send_message(f"🗑️ Deleted category `{category['name']}`.", ephemeral=True)
+
 class PanelDescModal(discord.ui.Modal, title="Edit Panel Description"):
     description = discord.ui.TextInput(
         label="Panel Description", 
@@ -1159,8 +1272,15 @@ class CategoryView(discord.ui.View):
     async def add(self, inter: discord.Interaction, button: discord.ui.Button):
         await inter.response.send_modal(AddCategoryModal())
 
-    # TODO: Add ability to edit existing categories from admin panel
-    @discord.ui.button(label="🗑️ Clear Categories", style=discord.ButtonStyle.red)
+    @discord.ui.button(label="✏️ Edit Category", style=discord.ButtonStyle.blurple)
+    async def edit(self, inter: discord.Interaction, button: discord.ui.Button):
+        await inter.response.send_modal(EditCategoryModal())
+
+    @discord.ui.button(label="🗑️ Delete Category", style=discord.ButtonStyle.red)
+    async def delete(self, inter: discord.Interaction, button: discord.ui.Button):
+        await inter.response.send_modal(DeleteCategoryModal())
+
+    @discord.ui.button(label="🗑️ Clear Categories", style=discord.ButtonStyle.gray)
     async def clear(self, inter: discord.Interaction, button: discord.ui.Button):
         clear_categories(inter.guild.id)
         await audit(inter.guild, inter.user, "cleared all categories")
@@ -1172,7 +1292,7 @@ class CategoryView(discord.ui.View):
         if not cats:
             text = "No categories configured."
         else:
-            text = "\n".join([f"• {c['name']}" for c in cats])
+            text = "\n".join([f"• {c['name']} (ID: `{c['id']}`)" for c in cats])
         await inter.response.send_message(f"**Categories:**\n{text}", ephemeral=True)
 
 class PanelManagerView(discord.ui.View):
