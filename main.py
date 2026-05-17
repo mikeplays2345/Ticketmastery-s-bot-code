@@ -128,6 +128,37 @@ def init_db():
         created_at INTEGER
     )""")
 
+    c.execute("""CREATE TABLE IF NOT EXISTS user_notes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        guild_id INTEGER,
+        user_id INTEGER,
+        note_text TEXT,
+        created_by INTEGER,
+        created_at INTEGER,
+        UNIQUE(guild_id, user_id)
+    )""")
+
+    c.execute("""CREATE TABLE IF NOT EXISTS closed_tickets_archive (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        guild_id INTEGER,
+        channel_id INTEGER,
+        owner_id INTEGER,
+        num INTEGER,
+        category_id INTEGER,
+        closed_at INTEGER,
+        closed_by INTEGER
+    )""")
+
+    # Add new columns to open_tickets if they don't exist
+    c.execute("PRAGMA table_info(open_tickets)")
+    columns = [col[1] for col in c.fetchall()]
+    
+    if 'assigned_to' not in columns:
+        c.execute("ALTER TABLE open_tickets ADD COLUMN assigned_to INTEGER DEFAULT NULL")
+    
+    if 'category_id' not in columns:
+        c.execute("ALTER TABLE open_tickets ADD COLUMN category_id INTEGER DEFAULT NULL")
+
     conn.commit()
     conn.close()
 
@@ -279,7 +310,9 @@ def get_open_tickets(gid: int) -> Dict[str, Dict[str, Any]]:
             "created_at": row[4],
             "last_activity": row[5],
             "reminded24": bool(row[6]),
-            "hold": bool(row[7])
+            "hold": bool(row[7]),
+            "assigned_to": row[8] if len(row) > 8 else None,
+            "category_id": row[9] if len(row) > 9 else None
         }
     return result
 
@@ -291,10 +324,11 @@ def set_open_tickets(gid: int, tickets: Dict[str, Dict[str, Any]]):
     # Insert new tickets
     for channel_id, info in tickets.items():
         c.execute('''INSERT INTO open_tickets 
-            (guild_id, channel_id, owner_id, num, created_at, last_activity, reminded24, hold)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+            (guild_id, channel_id, owner_id, num, created_at, last_activity, reminded24, hold, assigned_to, category_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
             (gid, int(channel_id), info["owner_id"], info["num"], info["created_at"], 
-             info["last_activity"], int(info["reminded24"]), int(info["hold"])))
+             info["last_activity"], int(info.get("reminded24", 0)), int(info.get("hold", 0)),
+             info.get("assigned_to"), info.get("category_id")))
     conn.commit()
     conn.close()
 
@@ -316,19 +350,21 @@ def get_all_open_tickets() -> Dict[str, Dict[str, Dict[str, Any]]]:
             "created_at": row[4],
             "last_activity": row[5],
             "reminded24": bool(row[6]),
-            "hold": bool(row[7])
+            "hold": bool(row[7]),
+            "assigned_to": row[8] if len(row) > 8 else None,
+            "category_id": row[9] if len(row) > 9 else None
         }
     return result
 
-def add_open_ticket(gid: int, channel_id: int, owner_id: int, num: int):
+def add_open_ticket(gid: int, channel_id: int, owner_id: int, num: int, category_id: int = None):
     now = int(time.time())
     conn = get_db_connection()
     c = conn.cursor()
     c.execute('''
         INSERT OR REPLACE INTO open_tickets
-        (guild_id, channel_id, owner_id, num, created_at, last_activity)
-        VALUES (?, ?, ?, ?, ?, ?)
-    ''', (gid, channel_id, owner_id, num, now, now))
+        (guild_id, channel_id, owner_id, num, created_at, last_activity, category_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    ''', (gid, channel_id, owner_id, num, now, now, category_id))
     conn.commit()
     conn.close()
 
@@ -361,7 +397,9 @@ def get_open_ticket(gid: int, channel_id: int):
         "created_at": row[4],
         "last_activity": row[5],
         "reminded24": bool(row[6]),
-        "hold": bool(row[7])
+        "hold": bool(row[7]),
+        "assigned_to": row[8] if len(row) > 8 else None,
+        "category_id": row[9] if len(row) > 9 else None
     }
 
 
@@ -385,7 +423,9 @@ def get_open_ticket_by_owner(gid: int, owner_id: int):
         "created_at": row[4],
         "last_activity": row[5],
         "reminded24": bool(row[6]),
-        "hold": bool(row[7])
+        "hold": bool(row[7]),
+        "assigned_to": row[8] if len(row) > 8 else None,
+        "category_id": row[9] if len(row) > 9 else None
     }
 
 
@@ -471,6 +511,119 @@ def get_avg_response_time(gid: int, staff_id: int) -> int:
     avg = c.fetchone()[0]
     conn.close()
     return int(avg) if avg else 0
+
+# ---------- NEW HELPER FUNCTIONS ----------
+
+def add_user_note(gid: int, user_id: int, note_text: str, created_by: int):
+    """Add or update a note for a user."""
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute('''
+        INSERT OR REPLACE INTO user_notes
+        (guild_id, user_id, note_text, created_by, created_at)
+        VALUES (?, ?, ?, ?, ?)
+    ''', (gid, user_id, note_text, created_by, int(time.time())))
+    conn.commit()
+    conn.close()
+
+def get_user_note(gid: int, user_id: int):
+    """Get note for a user."""
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute(
+        "SELECT note_text, created_by, created_at FROM user_notes WHERE guild_id=? AND user_id=?",
+        (gid, user_id)
+    )
+    row = c.fetchone()
+    conn.close()
+    if row:
+        return {"text": row[0], "created_by": row[1], "created_at": row[2]}
+    return None
+
+def archive_closed_ticket(gid: int, channel_id: int, owner_id: int, num: int, category_id: int, closed_by: int):
+    """Archive a closed ticket for potential reopening."""
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute('''
+        INSERT INTO closed_tickets_archive
+        (guild_id, channel_id, owner_id, num, category_id, closed_at, closed_by)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    ''', (gid, channel_id, owner_id, num, category_id, int(time.time()), closed_by))
+    conn.commit()
+    conn.close()
+
+def get_recent_closed_tickets(gid: int, owner_id: int, hours: int = 24):
+    """Get recently closed tickets for a user (within N hours)."""
+    cutoff = int(time.time()) - (hours * 3600)
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute('''
+        SELECT num, closed_at, category_id FROM closed_tickets_archive
+        WHERE guild_id=? AND owner_id=? AND closed_at > ?
+        ORDER BY closed_at DESC
+    ''', (gid, owner_id, cutoff))
+    rows = c.fetchall()
+    conn.close()
+    return [{"num": r[0], "closed_at": r[1], "category_id": r[2]} for r in rows]
+
+def search_tickets(gid: int, query: str):
+    """Search open tickets by user mention, ticket number, or category name."""
+    # Try to parse as user ID
+    user_id = None
+    try:
+        user_id = int(query)
+    except ValueError:
+        pass
+    
+    conn = get_db_connection()
+    c = conn.cursor()
+    results = []
+    
+    if user_id:
+        # Search by owner ID
+        c.execute('SELECT channel_id, num, created_at, owner_id FROM open_tickets WHERE guild_id=? AND owner_id=?', (gid, user_id))
+        results = c.fetchall()
+    else:
+        # Try ticket number
+        try:
+            num = int(query)
+            c.execute('SELECT channel_id, num, created_at, owner_id FROM open_tickets WHERE guild_id=? AND num=?', (gid, num))
+            results = c.fetchall()
+        except ValueError:
+            # Search by category name
+            c.execute('SELECT id FROM ticket_categories WHERE guild_id=? AND name LIKE ?', (gid, f"%{query}%"))
+            cat_rows = c.fetchall()
+            if cat_rows:
+                cat_id = cat_rows[0][0]
+                c.execute('SELECT channel_id, num, created_at, owner_id FROM open_tickets WHERE guild_id=? AND category_id=?', (gid, cat_id))
+                results = c.fetchall()
+    
+    conn.close()
+    return [{"channel_id": r[0], "num": r[1], "created_at": r[2], "owner_id": r[3]} for r in results]
+
+def assign_ticket(gid: int, channel_id: int, staff_id: int):
+    """Assign a ticket to staff."""
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute('''
+        UPDATE open_tickets
+        SET assigned_to = ?
+        WHERE guild_id=? AND channel_id=?
+    ''', (staff_id, gid, channel_id))
+    conn.commit()
+    conn.close()
+
+def unassign_ticket(gid: int, channel_id: int):
+    """Unassign a ticket."""
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute('''
+        UPDATE open_tickets
+        SET assigned_to = NULL
+        WHERE guild_id=? AND channel_id=?
+    ''', (gid, channel_id))
+    conn.commit()
+    conn.close()
 
 def build_transcript_embed(ticket_info: Dict[str, Any], closer: discord.User, channel: discord.TextChannel, guild: discord.Guild) -> discord.Embed:
     opener_id = ticket_info.get("owner_id")
@@ -823,8 +976,9 @@ class TicketManager:
                 reason=f"Ticket #{num} opened by {user}"
             )
             
-            # Register ticket
-            add_open_ticket(guild.id, tchan.id, user.id, num)
+            # Register ticket with category
+            category_id = category_data.get("id")
+            add_open_ticket(guild.id, tchan.id, user.id, num, category_id=category_id)
             
             return tchan
         finally:
@@ -844,38 +998,84 @@ class TicketManager:
         """
         try:
             # Build transcript
-            lines: List[str] = []
+            messages: List[tuple] = []
             try:
                 async for m in channel.history(limit=1000, oldest_first=True):
                     ts = m.created_at.strftime("%Y-%m-%d %H:%M:%S")
                     content = m.content or ""
-                    lines.append(f"[{ts}] {m.author}: {content}")
+                    messages.append((ts, m.author.name, content))
             except Exception:
                 pass
             
-            text = "\n".join(lines) if lines else "(empty)"
-            fobj = io.BytesIO(text.encode("utf-8"))
-            filename = f"ticket_{channel.id}_{int(time.time())}.txt"
-            file = discord.File(fobj, filename=filename)
+            # Build HTML transcript
+            html_lines = [
+                "<!DOCTYPE html>",
+                "<html>",
+                "<head>",
+                "    <meta charset='UTF-8'>",
+                "    <style>",
+                "        body { font-family: Arial, sans-serif; background-color: #2c2f33; color: #dcddde; margin: 20px; }",
+                "        .message { margin-bottom: 12px; padding: 8px; border-left: 3px solid #7289da; background-color: #36393f; }",
+                "        .timestamp { color: #72767d; font-size: 12px; }",
+                "        .author { color: #7289da; font-weight: bold; }",
+                "        .content { margin-top: 4px; word-wrap: break-word; }",
+                "    </style>",
+                "</head>",
+                "<body>"
+            ]
+            
+            if messages:
+                for ts, author, content in messages:
+                    html_lines.append(f'    <div class="message">')
+                    html_lines.append(f'        <div class="timestamp">{ts}</div>')
+                    html_lines.append(f'        <div class="author">{author}</div>')
+                    html_lines.append(f'        <div class="content">{content}</div>')
+                    html_lines.append(f'    </div>')
+            else:
+                html_lines.append('    <p><em>(No messages in transcript)</em></p>')
+            
+            html_lines.extend([
+                "</body>",
+                "</html>"
+            ])
+            
+            html_text = "\n".join(html_lines)
+            filename = f"ticket_{channel.id}_{int(time.time())}.html"
             
             # DM opener
             try:
                 opener = await bot.fetch_user(int(ticket_info.get("owner_id", closer.id)))
+                dm_file = discord.File(io.BytesIO(html_text.encode("utf-8")), filename=filename)
                 await opener.send(
                     f"📋 Your ticket transcript from **{guild.name}**.",
-                    file=file
+                    file=dm_file
                 )
             except Exception:
                 pass
             
             # Log with embed
             e = build_transcript_embed(ticket_info, closer, channel, guild)
-            lf = file if transcripts_enabled else None
-            await send_log(guild, e, file=lf)
+            
+            # Add transcript preview to embed
+            if messages:
+                transcript_preview = "\n".join([f"[{ts}] {author}: {content[:50]}" for ts, author, content in messages[-10:]])
+                e.add_field(name="📝 Transcript Preview (Last 10 messages)", value=f"```\n{transcript_preview}\n```", inline=False)
+            
+            if transcripts_enabled:
+                log_file = discord.File(io.BytesIO(html_text.encode("utf-8")), filename=filename)
+                await send_log(guild, e, file=log_file)
+            else:
+                await send_log(guild, e)
             
             # Track stats
             response_time = int(time.time()) - ticket_info.get("created_at", int(time.time()))
             add_close(guild.id, closer.id, response_time)
+            
+            # Archive for reopening
+            archive_closed_ticket(
+                guild.id, channel.id, ticket_info.get("owner_id"), 
+                ticket_info.get("num"), ticket_info.get("category_id"), closer.id
+            )
             
             # Remove from registry
             remove_open_ticket(guild.id, channel.id)
@@ -1610,6 +1810,218 @@ async def staff_stats(inter: discord.Interaction):
         lines.append(f"{name}: **{claimed}** claimed, **{closed}** closed, avg **{avg_mins}m** response")
     
     e = discord.Embed(title="📊 Staff Stats", description="\n".join(lines), color=BLUE)
+    await inter.response.send_message(embed=e, ephemeral=True)
+
+# ---------- NEW FEATURES ----------
+
+# ---- Ticket List ----
+@tree.command(name="ticket_list", description="List all open tickets in this server.")
+async def ticket_list(inter: discord.Interaction):
+    if not inter.guild:
+        return await inter.response.send_message("Guild only.", ephemeral=True)
+    
+    await inter.response.defer(ephemeral=True)
+    
+    tickets = get_open_tickets(inter.guild.id)
+    if not tickets:
+        return await inter.followup.send("📭 No open tickets.", ephemeral=True)
+    
+    lines = []
+    for ch_id_str, info in sorted(tickets.items(), key=lambda x: -x[1]["num"]):
+        num = info.get("num", "?")
+        owner_id = info.get("owner_id")
+        created = info.get("created_at", 0)
+        assigned = info.get("assigned_to")
+        
+        duration = int(time.time()) - created
+        hours = duration // 3600
+        mins = (duration % 3600) // 60
+        time_str = f"{hours}h {mins}m" if hours > 0 else f"{mins}m"
+        
+        owner_str = f"<@{owner_id}>" if owner_id else "Unknown"
+        assigned_str = f"👤 <@{assigned}>" if assigned else "unassigned"
+        
+        lines.append(f"**#{num}** · {owner_str} · {assigned_str} · {time_str}")
+    
+    e = discord.Embed(title=f"📋 Open Tickets ({len(lines)})", description="\n".join(lines[:15]), color=BLUE)
+    if len(lines) > 15:
+        e.set_footer(text=f"+{len(lines) - 15} more tickets")
+    await inter.followup.send(embed=e, ephemeral=True)
+
+# ---- Search Tickets ----
+@tree.command(name="search_ticket", description="Search for a ticket by user, number, or category.")
+@app_commands.describe(query="User ID/mention, ticket number, or category name")
+async def search_ticket(inter: discord.Interaction, query: str):
+    if not inter.guild:
+        return await inter.response.send_message("Guild only.", ephemeral=True)
+    
+    await inter.response.defer(ephemeral=True)
+    
+    results = search_tickets(inter.guild.id, query)
+    if not results:
+        return await inter.followup.send(f"❌ No tickets found for '{query}'.", ephemeral=True)
+    
+    lines = []
+    for r in results:
+        num = r.get("num", "?")
+        owner_id = r.get("owner_id")
+        created = r.get("created_at", 0)
+        ch_id = r.get("channel_id")
+        
+        duration = int(time.time()) - created
+        hours = duration // 3600
+        mins = (duration % 3600) // 60
+        time_str = f"{hours}h {mins}m" if hours > 0 else f"{mins}m"
+        
+        lines.append(f"**#{num}** · <#{ch_id}> · <@{owner_id}> · {time_str}")
+    
+    e = discord.Embed(title="🔍 Search Results", description="\n".join(lines[:10]), color=BLUE)
+    await inter.followup.send(embed=e, ephemeral=True)
+
+# ---- Claim/Unclaim Tracking ----
+@tree.command(name="assign_ticket", description="Assign this ticket to a staff member (Admin/Owner only).")
+@app_commands.describe(staff="The staff member to assign this ticket to")
+@admin_owner_check()
+async def assign_ticket_cmd(inter: discord.Interaction, staff: discord.User):
+    if not inter.guild:
+        return await inter.response.send_message("Guild only.", ephemeral=True)
+    
+    info = get_open_ticket(inter.guild.id, inter.channel.id)
+    if not info:
+        return await inter.response.send_message("❌ This isn't a ticket channel.", ephemeral=True)
+    
+    assign_ticket(inter.guild.id, inter.channel.id, staff.id)
+    await inter.response.send_message(f"✅ Ticket assigned to {staff.mention}", ephemeral=False)
+    await audit(inter.guild, inter.user, f"assigned ticket to {staff.mention}")
+
+@tree.command(name="unassign_ticket", description="Unassign this ticket (Admin/Owner only).")
+@admin_owner_check()
+async def unassign_ticket_cmd(inter: discord.Interaction):
+    if not inter.guild:
+        return await inter.response.send_message("Guild only.", ephemeral=True)
+    
+    info = get_open_ticket(inter.guild.id, inter.channel.id)
+    if not info:
+        return await inter.response.send_message("❌ This isn't a ticket channel.", ephemeral=True)
+    
+    unassign_ticket(inter.guild.id, inter.channel.id)
+    await inter.response.send_message("✅ Ticket unassigned.", ephemeral=False)
+    await audit(inter.guild, inter.user, "unassigned ticket")
+
+# ---- Bulk Close ----
+@tree.command(name="bulk_close_idle", description="Close all tickets idle for X hours (Admin/Owner only).")
+@app_commands.describe(hours="Hours of inactivity to consider idle (default 24)")
+@admin_owner_check()
+async def bulk_close_idle(inter: discord.Interaction, hours: int = 24):
+    if not inter.guild:
+        return await inter.response.send_message("Guild only.", ephemeral=True)
+    
+    await inter.response.defer(thinking=True, ephemeral=True)
+    
+    tickets = get_open_tickets(inter.guild.id)
+    now = int(time.time())
+    idle_threshold = now - (hours * 3600)
+    
+    closed_count = 0
+    for ch_id_str, info in tickets.items():
+        last_activity = info.get("last_activity", info.get("created_at", 0))
+        if last_activity < idle_threshold:
+            ch_id = int(ch_id_str)
+            try:
+                ch = inter.guild.get_channel(ch_id)
+                if ch:
+                    # Close the ticket
+                    success = await TicketManager.close_ticket(
+                        inter.guild, ch, inter.user, info,
+                        transcripts_enabled=get_gcfg(inter.guild.id).get("log_transcripts", True)
+                    )
+                    if success:
+                        closed_count += 1
+            except Exception:
+                pass
+    
+    await inter.followup.send(f"✅ Closed {closed_count} idle tickets.", ephemeral=True)
+    await audit(inter.guild, inter.user, f"bulk-closed {closed_count} idle tickets")
+
+# ---- Reopen Ticket ----
+@tree.command(name="reopen_ticket", description="Reopen one of your recently closed tickets (within 24h).")
+@app_commands.describe(ticket_num="The ticket number to reopen")
+async def reopen_ticket(inter: discord.Interaction, ticket_num: int):
+    if not inter.guild:
+        return await inter.response.send_message("Guild only.", ephemeral=True)
+    
+    await inter.response.defer(thinking=True, ephemeral=True)
+    
+    # Get recent closed tickets for this user
+    recent = get_recent_closed_tickets(inter.guild.id, inter.user.id, hours=24)
+    
+    ticket_data = None
+    for t in recent:
+        if t["num"] == ticket_num:
+            ticket_data = t
+            break
+    
+    if not ticket_data:
+        return await inter.followup.send(f"❌ Ticket #{ticket_num} not found in your recent tickets.", ephemeral=True)
+    
+    # Create new ticket with same category
+    gcfg = get_gcfg(inter.guild.id)
+    gcfg["tickets_created"] = int(gcfg.get("tickets_created", 0)) + 1
+    num = gcfg["tickets_created"]
+    set_gcfg(inter.guild.id, gcfg)
+    
+    category_id = ticket_data.get("category_id")
+    category = get_category(inter.guild.id, category_id) if category_id else None
+    
+    if not category:
+        return await inter.followup.send("❌ The original category no longer exists.", ephemeral=True)
+    
+    # Create the ticket
+    tchan = await TicketManager.create_ticket(inter, inter.guild, inter.user, category, gcfg)
+    if tchan:
+        await inter.followup.send(f"✅ Reopened as {tchan.mention}", ephemeral=True)
+    else:
+        await inter.followup.send("❌ Failed to reopen ticket.", ephemeral=True)
+
+# ---- User Notes ----
+@tree.command(name="note_user", description="Add or update a note for a user (Admin/Owner only).")
+@app_commands.describe(user="The user to note", note="The note text")
+@admin_owner_check()
+async def note_user(inter: discord.Interaction, user: discord.User, note: str):
+    if not inter.guild:
+        return await inter.response.send_message("Guild only.", ephemeral=True)
+    
+    add_user_note(inter.guild.id, user.id, note, inter.user.id)
+    await inter.response.send_message(f"✅ Note added for {user.mention}:\n```\n{note}\n```", ephemeral=True)
+    await audit(inter.guild, inter.user, f"added note for {user.mention}")
+
+@tree.command(name="user_note", description="View the note for a user.")
+@app_commands.describe(user="The user")
+async def user_note(inter: discord.Interaction, user: discord.User):
+    if not inter.guild:
+        return await inter.response.send_message("Guild only.", ephemeral=True)
+    
+    note_data = get_user_note(inter.guild.id, user.id)
+    if not note_data:
+        return await inter.response.send_message(f"📝 No notes for {user.mention}.", ephemeral=True)
+    
+    created_by = note_data.get("created_by", 0)
+    created_at = note_data.get("created_at", 0)
+    
+    try:
+        creator = await inter.client.fetch_user(created_by)
+        creator_str = creator.mention
+    except:
+        creator_str = f"<@{created_by}>"
+    
+    created_str = datetime.fromtimestamp(created_at).strftime("%B %d, %Y at %I:%M %p")
+    
+    e = discord.Embed(
+        title=f"📝 Note for {user}",
+        description=note_data.get("text", ""),
+        color=BLUE
+    )
+    e.set_footer(text=f"By {creator_str} on {created_str}")
     await inter.response.send_message(embed=e, ephemeral=True)
 
 # ---------- RUN ----------
