@@ -1590,44 +1590,22 @@ async def on_ready():
     except Exception as e:
         print(f"add_view warning: {e}")
 
-    # Repost panels on startup
+    # Register persistent views for existing panels on startup
     all_gcfg = get_all_gcfg()
     for gid_str, gcfg_data in all_gcfg.items():
         gid = int(gid_str)
         guild = bot.get_guild(gid)
         if not guild:
             continue
-        
-        panel_ch_id = gcfg_data.get("panel_channel_id")
+
         panel_msg_id = gcfg_data.get("panel_message_id")
         cats = get_categories(gid)
-        
-        if not panel_ch_id or not cats:
+        if not panel_msg_id or not cats:
             continue
 
-        channel = guild.get_channel(panel_ch_id)
-        if not channel:
-            continue
-
-        # Delete old panel
         try:
-            old_msg = await channel.fetch_message(panel_msg_id)
-            await old_msg.delete()
-        except Exception:
-            pass
-
-        # Repost new panel
-        embed = discord.Embed(
-            title="🎫 Open a Ticket",
-            description=gcfg_data.get("panel_description") or "Open a ticket using the buttons below.",
-            color=BLUE
-        )
-        view = build_panel_view(guild)
-        try:
-            new_msg = await channel.send(embed=embed, view=view)
-            # Update config with new message ID
-            gcfg_data["panel_message_id"] = new_msg.id
-            set_gcfg(gid, gcfg_data)
+            view = build_panel_view(guild)
+            bot.add_view(view, message_id=panel_msg_id)
         except Exception:
             pass
 
